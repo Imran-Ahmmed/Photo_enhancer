@@ -11,6 +11,7 @@ import android.os.Looper
 import android.provider.MediaStore
 import android.view.Gravity
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
@@ -27,6 +28,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var status: TextView
     private lateinit var btnEnhance: Button
     private lateinit var btnSave: Button
+    private lateinit var cbBoost: CheckBox
 
     private val picker = registerForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
         if (uri != null) {
@@ -49,6 +51,8 @@ class MainActivity : ComponentActivity() {
         root.addView(image, LinearLayout.LayoutParams(-1, 0, 1f))
         status = TextView(this).apply { text = "Choose a photo"; gravity = Gravity.CENTER; setPadding(0, 16, 0, 16) }
         root.addView(status)
+        cbBoost = CheckBox(this).apply { text = "Brighten dark areas (for dark faces)"; isChecked = false }
+        root.addView(cbBoost)
         val pick = Button(this).apply { text = "Choose photo"; setOnClickListener { picker.launch("image/*") } }
         btnEnhance = Button(this).apply { text = "Enhance"; isEnabled = false; setOnClickListener { enhance() } }
         btnSave = Button(this).apply { text = "Save to gallery"; isEnabled = false; setOnClickListener { save() } }
@@ -58,14 +62,15 @@ class MainActivity : ComponentActivity() {
 
     private fun enhance() {
         val src = original ?: return
+        val boost = cbBoost.isChecked
         btnEnhance.isEnabled = false
         status.text = "Enhancing... 0%"
         thread {
             try {
                 val enhanced = Enhancer(this).enhance(src) { p -> ui.post { status.text = "Enhancing... $p%" } }
                 ui.post { status.text = "Finishing colors..." }
-                val lifted = shadowLift(enhanced)
-                val out = postProcess(lifted, autoGamma(lifted))
+                val base = if (boost) shadowLift(enhanced) else enhanced
+                val out = postProcess(base, if (boost) autoGamma(base) else 1.0f)
                 result = out
                 ui.post {
                     image.setImageBitmap(out)
@@ -94,12 +99,11 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-// অন্ধকার অংশ বেশি উজ্জ্বল করে, উজ্জ্বল অংশ প্রায় একই রাখে (মুখ আলো করার জন্য)
+// অন্ধকার অংশ উজ্জ্বল করে, উজ্জ্বল অংশ প্রায় একই রাখে
 fun shadowLift(src: Bitmap): Bitmap {
     val w = src.width
     val h = src.height
 
-    // ছোট আকারের luminance map (এলাকাভিত্তিক গড় আলো)
     val sw = maxOf(2, w / 32)
     val sh = maxOf(2, h / 32)
     val small = Bitmap.createScaledBitmap(src, sw, sh, true)
@@ -130,7 +134,7 @@ fun shadowLift(src: Bitmap): Bitmap {
                 val b = lm[(y0 + 1) * sw + x0] * (1 - tx) + lm[(y0 + 1) * sw + x0 + 1] * tx
                 val local = (a * (1 - ty) + b * ty).coerceAtLeast(0.03f)
 
-                val gain = Math.pow((0.5 / local).toDouble(), 0.75).toFloat().coerceIn(1f, 2.5f)
+                val gain = Math.pow((0.4 / local).toDouble(), 0.6).toFloat().coerceIn(1f, 1.9f)
 
                 val idx = ry * w + x
                 val p = buf[idx]
@@ -152,7 +156,7 @@ fun shadowLift(src: Bitmap): Bitmap {
     return out
 }
 
-// ছবির গড় আলো দেখে gamma ঠিক করে (অন্ধকার ছবি বেশি উজ্জ্বল হবে, ভালো ছবি প্রায় একই থাকবে)
+// ছবির গড় আলো দেখে gamma ঠিক করে
 fun autoGamma(src: Bitmap): Float {
     var sum = 0.0
     var n = 0
@@ -171,10 +175,10 @@ fun autoGamma(src: Bitmap): Float {
         y += step
     }
     val mean = (sum / n / 255.0).coerceIn(0.05, 0.95)
-    return (Math.log(0.45) / Math.log(mean)).toFloat().coerceIn(0.55f, 1.0f)
+    return (Math.log(0.45) / Math.log(mean)).toFloat().coerceIn(0.75f, 1.0f)
 }
 
-// shadow lift (gamma) + saturation + contrast + warm tone, সব এক ধাপে, ছোট অংশে ভাগ করে
+// হালকা color grading (আগের চেয়ে অনেক নরম)
 fun postProcess(src: Bitmap, gamma: Float): Bitmap {
     val w = src.width
     val h = src.height
@@ -183,12 +187,12 @@ fun postProcess(src: Bitmap, gamma: Float): Bitmap {
     val lut = IntArray(256) { i ->
         (255.0 * Math.pow(i / 255.0, gamma.toDouble())).toInt().coerceIn(0, 255)
     }
-    val sat = 1.15f
-    val contrast = 1.12f
-    val bright = 8f
-    val rGain = contrast * 1.04f   // একটু warm
+    val sat = 1.03f
+    val contrast = 1.03f
+    val bright = 0f
+    val rGain = contrast * 1.01f
     val gGain = contrast
-    val bGain = contrast * 0.96f
+    val bGain = contrast * 0.99f
 
     val rowsPerChunk = maxOf(1, 1_000_000 / w)
     val buf = IntArray(w * rowsPerChunk)
