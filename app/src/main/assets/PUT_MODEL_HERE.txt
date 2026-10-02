@@ -1,1 +1,0 @@
-Ekhane Real-ESRGAN er .tflite model file ta "model.tflite" naam e rakho.
