@@ -64,7 +64,8 @@ class MainActivity : ComponentActivity() {
             try {
                 val enhanced = Enhancer(this).enhance(src) { p -> ui.post { status.text = "Enhancing... $p%" } }
                 ui.post { status.text = "Finishing colors..." }
-                val out = postProcess(enhanced, autoGamma(enhanced))
+                val lifted = shadowLift(enhanced)
+                val out = postProcess(lifted, autoGamma(lifted))
                 result = out
                 ui.post {
                     image.setImageBitmap(out)
@@ -91,6 +92,64 @@ class MainActivity : ComponentActivity() {
             Toast.makeText(this, "Saved to Pictures/PhotoEnhancer", Toast.LENGTH_LONG).show()
         }
     }
+}
+
+// অন্ধকার অংশ বেশি উজ্জ্বল করে, উজ্জ্বল অংশ প্রায় একই রাখে (মুখ আলো করার জন্য)
+fun shadowLift(src: Bitmap): Bitmap {
+    val w = src.width
+    val h = src.height
+
+    // ছোট আকারের luminance map (এলাকাভিত্তিক গড় আলো)
+    val sw = maxOf(2, w / 32)
+    val sh = maxOf(2, h / 32)
+    val small = Bitmap.createScaledBitmap(src, sw, sh, true)
+    val sp = IntArray(sw * sh)
+    small.getPixels(sp, 0, sw, 0, 0, sw, sh)
+    val lm = FloatArray(sw * sh) { i ->
+        val p = sp[i]
+        (0.299f * ((p shr 16) and 0xFF) + 0.587f * ((p shr 8) and 0xFF) + 0.114f * (p and 0xFF)) / 255f
+    }
+    small.recycle()
+
+    val out = src.copy(Bitmap.Config.ARGB_8888, true)
+    val rowsPerChunk = maxOf(1, 1_000_000 / w)
+    val buf = IntArray(w * rowsPerChunk)
+    var y = 0
+    while (y < h) {
+        val rows = minOf(rowsPerChunk, h - y)
+        out.getPixels(buf, 0, w, 0, y, w, rows)
+        for (ry in 0 until rows) {
+            val fy = ((y + ry) * (sh - 1).toFloat() / (h - 1).coerceAtLeast(1))
+            val y0 = fy.toInt().coerceIn(0, sh - 2)
+            val ty = fy - y0
+            for (x in 0 until w) {
+                val fx = x * (sw - 1).toFloat() / (w - 1).coerceAtLeast(1)
+                val x0 = fx.toInt().coerceIn(0, sw - 2)
+                val tx = fx - x0
+                val a = lm[y0 * sw + x0] * (1 - tx) + lm[y0 * sw + x0 + 1] * tx
+                val b = lm[(y0 + 1) * sw + x0] * (1 - tx) + lm[(y0 + 1) * sw + x0 + 1] * tx
+                val local = (a * (1 - ty) + b * ty).coerceAtLeast(0.03f)
+
+                val gain = Math.pow((0.5 / local).toDouble(), 0.75).toFloat().coerceIn(1f, 2.5f)
+
+                val idx = ry * w + x
+                val p = buf[idx]
+                val r = (p shr 16) and 0xFF
+                val g = (p shr 8) and 0xFF
+                val bl = p and 0xFF
+                val pl = (0.299f * r + 0.587f * g + 0.114f * bl) / 255f
+                val eff = 1f + (gain - 1f) * (1f - pl)
+
+                val nr = (r * eff).toInt().coerceIn(0, 255)
+                val ng = (g * eff).toInt().coerceIn(0, 255)
+                val nb = (bl * eff).toInt().coerceIn(0, 255)
+                buf[idx] = (0xFF shl 24) or (nr shl 16) or (ng shl 8) or nb
+            }
+        }
+        out.setPixels(buf, 0, w, 0, y, w, rows)
+        y += rows
+    }
+    return out
 }
 
 // ছবির গড় আলো দেখে gamma ঠিক করে (অন্ধকার ছবি বেশি উজ্জ্বল হবে, ভালো ছবি প্রায় একই থাকবে)
