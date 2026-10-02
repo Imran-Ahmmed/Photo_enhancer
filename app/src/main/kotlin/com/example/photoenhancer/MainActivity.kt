@@ -62,7 +62,9 @@ class MainActivity : ComponentActivity() {
         status.text = "Enhancing... 0%"
         thread {
             try {
-                val out = Enhancer(this).enhance(src) { p -> ui.post { status.text = "Enhancing... $p%" } }
+                val enhanced = Enhancer(this).enhance(src) { p -> ui.post { status.text = "Enhancing... $p%" } }
+                ui.post { status.text = "Finishing colors..." }
+                val out = postProcess(enhanced, autoGamma(enhanced))
                 result = out
                 ui.post {
                     image.setImageBitmap(out)
@@ -89,4 +91,71 @@ class MainActivity : ComponentActivity() {
             Toast.makeText(this, "Saved to Pictures/PhotoEnhancer", Toast.LENGTH_LONG).show()
         }
     }
+}
+
+// ছবির গড় আলো দেখে gamma ঠিক করে (অন্ধকার ছবি বেশি উজ্জ্বল হবে, ভালো ছবি প্রায় একই থাকবে)
+fun autoGamma(src: Bitmap): Float {
+    var sum = 0.0
+    var n = 0
+    val step = maxOf(8, minOf(src.width, src.height) / 200)
+    var y = 0
+    while (y < src.height) {
+        var x = 0
+        while (x < src.width) {
+            val p = src.getPixel(x, y)
+            val l = 0.299 * ((p shr 16) and 0xFF) +
+                    0.587 * ((p shr 8) and 0xFF) +
+                    0.114 * (p and 0xFF)
+            sum += l; n++
+            x += step
+        }
+        y += step
+    }
+    val mean = (sum / n / 255.0).coerceIn(0.05, 0.95)
+    return (Math.log(0.45) / Math.log(mean)).toFloat().coerceIn(0.55f, 1.0f)
+}
+
+// shadow lift (gamma) + saturation + contrast + warm tone, সব এক ধাপে, ছোট অংশে ভাগ করে
+fun postProcess(src: Bitmap, gamma: Float): Bitmap {
+    val w = src.width
+    val h = src.height
+    val out = src.copy(Bitmap.Config.ARGB_8888, true)
+
+    val lut = IntArray(256) { i ->
+        (255.0 * Math.pow(i / 255.0, gamma.toDouble())).toInt().coerceIn(0, 255)
+    }
+    val sat = 1.15f
+    val contrast = 1.12f
+    val bright = 8f
+    val rGain = contrast * 1.04f   // একটু warm
+    val gGain = contrast
+    val bGain = contrast * 0.96f
+
+    val rowsPerChunk = maxOf(1, 1_000_000 / w)
+    val buf = IntArray(w * rowsPerChunk)
+    var y = 0
+    while (y < h) {
+        val rows = minOf(rowsPerChunk, h - y)
+        out.getPixels(buf, 0, w, 0, y, w, rows)
+        for (i in 0 until w * rows) {
+            val p = buf[i]
+            val a = p ushr 24
+            var r = lut[(p shr 16) and 0xFF].toFloat()
+            var g = lut[(p shr 8) and 0xFF].toFloat()
+            var b = lut[p and 0xFF].toFloat()
+
+            val lum = 0.213f * r + 0.715f * g + 0.072f * b
+            r = lum + (r - lum) * sat
+            g = lum + (g - lum) * sat
+            b = lum + (b - lum) * sat
+
+            val ri = (r * rGain + bright).toInt().coerceIn(0, 255)
+            val gi = (g * gGain + bright).toInt().coerceIn(0, 255)
+            val bi = (b * bGain + bright).toInt().coerceIn(0, 255)
+            buf[i] = (a shl 24) or (ri shl 16) or (gi shl 8) or bi
+        }
+        out.setPixels(buf, 0, w, 0, y, w, rows)
+        y += rows
+    }
+    return out
 }
