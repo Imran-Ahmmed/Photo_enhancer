@@ -1,9 +1,10 @@
 package com.example.photoenhancer
 
-import android.app.Activity
 import android.content.ContentValues
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Canvas
+import android.graphics.Paint
 import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
@@ -11,9 +12,9 @@ import android.os.Looper
 import android.provider.MediaStore
 import android.view.Gravity
 import android.widget.Button
-import android.widget.CheckBox
 import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -28,7 +29,8 @@ class MainActivity : ComponentActivity() {
     private lateinit var status: TextView
     private lateinit var btnEnhance: Button
     private lateinit var btnSave: Button
-    private lateinit var cbBoost: CheckBox
+    private lateinit var seek: SeekBar
+    private lateinit var seekLabel: TextView
 
     private val picker = registerForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
         if (uri != null) {
@@ -49,10 +51,26 @@ class MainActivity : ComponentActivity() {
         }
         image = ImageView(this).apply { scaleType = ImageView.ScaleType.FIT_CENTER }
         root.addView(image, LinearLayout.LayoutParams(-1, 0, 1f))
-        status = TextView(this).apply { text = "Choose a photo"; gravity = Gravity.CENTER; setPadding(0, 16, 0, 16) }
+        status = TextView(this).apply {
+            text = "Choose a photo"; gravity = Gravity.CENTER; setPadding(0, 16, 0, 16)
+        }
         root.addView(status)
-        cbBoost = CheckBox(this).apply { text = "Brighten dark areas (for dark faces)"; isChecked = false }
-        root.addView(cbBoost)
+
+        seekLabel = TextView(this).apply { text = "Face brightness: 33" }
+        seek = SeekBar(this).apply {
+            max = 100
+            progress = 33
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
+                    seekLabel.text = "Face brightness: $p"
+                }
+                override fun onStartTrackingTouch(s: SeekBar?) {}
+                override fun onStopTrackingTouch(s: SeekBar?) {}
+            })
+        }
+        root.addView(seekLabel)
+        root.addView(seek)
+
         val pick = Button(this).apply { text = "Choose photo"; setOnClickListener { picker.launch("image/*") } }
         btnEnhance = Button(this).apply { text = "Enhance"; isEnabled = false; setOnClickListener { enhance() } }
         btnSave = Button(this).apply { text = "Save to gallery"; isEnabled = false; setOnClickListener { save() } }
@@ -62,15 +80,18 @@ class MainActivity : ComponentActivity() {
 
     private fun enhance() {
         val src = original ?: return
-        val boost = cbBoost.isChecked
+        val strength = seek.progress / 100f
         btnEnhance.isEnabled = false
         status.text = "Enhancing... 0%"
         thread {
             try {
-                val enhanced = Enhancer(this).enhance(src) { p -> ui.post { status.text = "Enhancing... $p%" } }
-                ui.post { status.text = "Finishing colors..." }
-                val base = if (boost) shadowLift(enhanced) else enhanced
-                val out = postProcess(base, if (boost) autoGamma(base) else 1.0f)
+                val enhanced = Enhancer(this).enhance(src) { p ->
+                    ui.post { status.text = "Enhancing... $p%" }
+                }
+                ui.post { status.text = "Finishing..." }
+                val blended = blendWithOriginal(enhanced, src, 0.22f)
+                val lifted = if (strength > 0f) faceLift(blended, strength) else blended
+                val out = postProcess(lifted, 1.0f)
                 result = out
                 ui.post {
                     image.setImageBitmap(out)
@@ -99,54 +120,127 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-// অন্ধকার অংশ উজ্জ্বল করে, উজ্জ্বল অংশ প্রায় একই রাখে
-fun shadowLift(src: Bitmap): Bitmap {
+// Model-এর ফলের ওপর আসল ছবির কিছুটা মিশিয়ে halo ও "painting" ভাব কমায়
+fun blendWithOriginal(enh: Bitmap, orig: Bitmap, a: Float): Bitmap {
+    val out = enh.copy(Bitmap.Config.ARGB_8888, true)
+    val up = Bitmap.createScaledBitmap(orig, out.width, out.height, true)
+    val p = Paint(Paint.FILTER_BITMAP_FLAG).apply { alpha = (a * 255).toInt() }
+    Canvas(out).drawBitmap(up, 0f, 0f, p)
+    up.recycle()
+    return out
+}
+
+private fun bandWeight(v: Float, lo: Float, hi: Float, margin: Float): Float {
+    return when {
+        v < lo -> maxOf(0f, 1f - (lo - v) / margin)
+        v > hi -> maxOf(0f, 1f - (v - hi) / margin)
+        else -> 1f
+    }
+}
+
+// ত্বকের রং (YCbCr) কতটা মিলছে, ০..১
+private fun skinWeight(r: Int, g: Int, b: Int): Float {
+    val y = 0.299f * r + 0.587f * g + 0.114f * b
+    if (y < 8f) return 0f
+    val cb = 128f - 0.168736f * r - 0.331264f * g + 0.5f * b
+    val cr = 128f + 0.5f * r - 0.418688f * g - 0.081312f * b
+    return bandWeight(cb, 77f, 127f, 8f) * bandWeight(cr, 133f, 173f, 4f)
+}
+
+// শুধু ত্বকের জায়গায় আলো বাড়ায়। রঙের অনুপাত ঠিক থাকে।
+fun faceLift(src: Bitmap, strength: Float): Bitmap {
     val w = src.width
     val h = src.height
+    val cell = 16
+    val cw = (w + cell - 1) / cell
+    val chh = (h + cell - 1) / cell
+    val sum = FloatArray(cw * chh)
+    val cnt = FloatArray(cw * chh)
 
-    val sw = maxOf(2, w / 32)
-    val sh = maxOf(2, h / 32)
-    val small = Bitmap.createScaledBitmap(src, sw, sh, true)
-    val sp = IntArray(sw * sh)
-    small.getPixels(sp, 0, sw, 0, 0, sw, sh)
-    val lm = FloatArray(sw * sh) { i ->
-        val p = sp[i]
-        (0.299f * ((p shr 16) and 0xFF) + 0.587f * ((p shr 8) and 0xFF) + 0.114f * (p and 0xFF)) / 255f
-    }
-    small.recycle()
-
-    val out = src.copy(Bitmap.Config.ARGB_8888, true)
     val rowsPerChunk = maxOf(1, 1_000_000 / w)
     val buf = IntArray(w * rowsPerChunk)
+
+    // ধাপ ১: প্রতিটা ১৬x১৬ ঘরে ত্বকের গড় পরিমাণ
     var y = 0
+    while (y < h) {
+        val rows = minOf(rowsPerChunk, h - y)
+        src.getPixels(buf, 0, w, 0, y, w, rows)
+        for (ry in 0 until rows) {
+            val cy = (y + ry) / cell
+            for (x in 0 until w) {
+                val p = buf[ry * w + x]
+                val wt = skinWeight((p shr 16) and 0xFF, (p shr 8) and 0xFF, p and 0xFF)
+                val ci = cy * cw + x / cell
+                sum[ci] += wt
+                cnt[ci] += 1f
+            }
+        }
+        y += rows
+    }
+
+    var mask = FloatArray(cw * chh) { i -> minOf(1f, (sum[i] / cnt[i].coerceAtLeast(1f)) * 1.5f) }
+
+    // ধাপ ২: mask নরম (feather) করা, ২ বার 3x3 blur
+    repeat(2) {
+        val nm = FloatArray(cw * chh)
+        for (j in 0 until chh) for (i in 0 until cw) {
+            var s = 0f
+            var c = 0
+            for (dj in -1..1) for (di in -1..1) {
+                val jj = j + dj
+                val ii = i + di
+                if (jj in 0 until chh && ii in 0 until cw) { s += mask[jj * cw + ii]; c++ }
+            }
+            nm[j * cw + i] = s / c
+        }
+        mask = nm
+    }
+
+    // আলো বাড়ার lookup: গাঢ় অংশে বেশি, উজ্জ্বল অংশে প্রায় নেই
+    val g = 1f - 0.5f * strength
+    val kLut = FloatArray(256) { i ->
+        val yy = maxOf(i, 3) / 255f
+        val k = Math.pow(yy.toDouble(), g.toDouble()).toFloat() / yy
+        val protect = 1f - yy * yy
+        (1f + (minOf(k, 2.2f) - 1f) * protect)
+    }
+
+    val out = src.copy(Bitmap.Config.ARGB_8888, true)
+
+    // ধাপ ৩: প্রয়োগ
+    y = 0
     while (y < h) {
         val rows = minOf(rowsPerChunk, h - y)
         out.getPixels(buf, 0, w, 0, y, w, rows)
         for (ry in 0 until rows) {
-            val fy = ((y + ry) * (sh - 1).toFloat() / (h - 1).coerceAtLeast(1))
-            val y0 = fy.toInt().coerceIn(0, sh - 2)
-            val ty = fy - y0
+            val fy = (y + ry + 0.5f) / cell - 0.5f
+            val j0 = Math.floor(fy.toDouble()).toInt().coerceIn(0, chh - 1)
+            val j1 = (j0 + 1).coerceAtMost(chh - 1)
+            val ty = (fy - j0).coerceIn(0f, 1f)
             for (x in 0 until w) {
-                val fx = x * (sw - 1).toFloat() / (w - 1).coerceAtLeast(1)
-                val x0 = fx.toInt().coerceIn(0, sw - 2)
-                val tx = fx - x0
-                val a = lm[y0 * sw + x0] * (1 - tx) + lm[y0 * sw + x0 + 1] * tx
-                val b = lm[(y0 + 1) * sw + x0] * (1 - tx) + lm[(y0 + 1) * sw + x0 + 1] * tx
-                val local = (a * (1 - ty) + b * ty).coerceAtLeast(0.03f)
-
-                val gain = Math.pow((0.4 / local).toDouble(), 0.6).toFloat().coerceIn(1f, 1.9f)
+                val fx = (x + 0.5f) / cell - 0.5f
+                val i0 = Math.floor(fx.toDouble()).toInt().coerceIn(0, cw - 1)
+                val i1 = (i0 + 1).coerceAtMost(cw - 1)
+                val tx = (fx - i0).coerceIn(0f, 1f)
+                val m0 = mask[j0 * cw + i0] * (1 - tx) + mask[j0 * cw + i1] * tx
+                val m1 = mask[j1 * cw + i0] * (1 - tx) + mask[j1 * cw + i1] * tx
+                val region = m0 * (1 - ty) + m1 * ty
+                if (region < 0.01f) continue
 
                 val idx = ry * w + x
                 val p = buf[idx]
                 val r = (p shr 16) and 0xFF
-                val g = (p shr 8) and 0xFF
-                val bl = p and 0xFF
-                val pl = (0.299f * r + 0.587f * g + 0.114f * bl) / 255f
-                val eff = 1f + (gain - 1f) * (1f - pl)
+                val gg = (p shr 8) and 0xFF
+                val b = p and 0xFF
+                val pw = skinWeight(r, gg, b)
+                val m = region * (0.4f + 0.6f * pw)
 
-                val nr = (r * eff).toInt().coerceIn(0, 255)
-                val ng = (g * eff).toInt().coerceIn(0, 255)
-                val nb = (bl * eff).toInt().coerceIn(0, 255)
+                val yi = (0.299f * r + 0.587f * gg + 0.114f * b).toInt().coerceIn(0, 255)
+                val k = 1f + (kLut[yi] - 1f) * m
+
+                val nr = (r * k).toInt().coerceIn(0, 255)
+                val ng = (gg * k).toInt().coerceIn(0, 255)
+                val nb = (b * k).toInt().coerceIn(0, 255)
                 buf[idx] = (0xFF shl 24) or (nr shl 16) or (ng shl 8) or nb
             }
         }
@@ -156,29 +250,7 @@ fun shadowLift(src: Bitmap): Bitmap {
     return out
 }
 
-// ছবির গড় আলো দেখে gamma ঠিক করে
-fun autoGamma(src: Bitmap): Float {
-    var sum = 0.0
-    var n = 0
-    val step = maxOf(8, minOf(src.width, src.height) / 200)
-    var y = 0
-    while (y < src.height) {
-        var x = 0
-        while (x < src.width) {
-            val p = src.getPixel(x, y)
-            val l = 0.299 * ((p shr 16) and 0xFF) +
-                    0.587 * ((p shr 8) and 0xFF) +
-                    0.114 * (p and 0xFF)
-            sum += l; n++
-            x += step
-        }
-        y += step
-    }
-    val mean = (sum / n / 255.0).coerceIn(0.05, 0.95)
-    return (Math.log(0.45) / Math.log(mean)).toFloat().coerceIn(0.75f, 1.0f)
-}
-
-// হালকা color grading (আগের চেয়ে অনেক নরম)
+// হালকা color grading
 fun postProcess(src: Bitmap, gamma: Float): Bitmap {
     val w = src.width
     val h = src.height
@@ -189,7 +261,6 @@ fun postProcess(src: Bitmap, gamma: Float): Bitmap {
     }
     val sat = 1.03f
     val contrast = 1.03f
-    val bright = 0f
     val rGain = contrast * 1.01f
     val gGain = contrast
     val bGain = contrast * 0.99f
@@ -212,9 +283,9 @@ fun postProcess(src: Bitmap, gamma: Float): Bitmap {
             g = lum + (g - lum) * sat
             b = lum + (b - lum) * sat
 
-            val ri = (r * rGain + bright).toInt().coerceIn(0, 255)
-            val gi = (g * gGain + bright).toInt().coerceIn(0, 255)
-            val bi = (b * bGain + bright).toInt().coerceIn(0, 255)
+            val ri = (r * rGain).toInt().coerceIn(0, 255)
+            val gi = (g * gGain).toInt().coerceIn(0, 255)
+            val bi = (b * bGain).toInt().coerceIn(0, 255)
             buf[i] = (a shl 24) or (ri shl 16) or (gi shl 8) or bi
         }
         out.setPixels(buf, 0, w, 0, y, w, rows)
