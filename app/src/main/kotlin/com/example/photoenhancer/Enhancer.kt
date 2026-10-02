@@ -34,7 +34,7 @@ class Enhancer(ctx: Context) {
 
         val w = src.width
         val h = src.height
-        val pad = 8
+        val pad = 16
         val step = tile - 2 * pad
         val outT = tile * scale
         val out = Bitmap.createBitmap(w * scale, h * scale, Bitmap.Config.ARGB_8888)
